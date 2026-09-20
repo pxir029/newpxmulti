@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "PXPanel"
-APP_VERSION = "14.0.0"
+APP_VERSION = "14.1.0"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -1028,13 +1028,41 @@ def generate_vless_link(
         return f"hysteria2://{uuid}@{host}:{port_value}/?sni={quote(host)}&insecure=0&obfs=salamander#{label}"
     return f"vless://{uuid}@{host}:{port_value}"
 
+
+def node_host_from_link(link: dict, fallback_host: str) -> str:
+    """If link is bound to a multi-location node, use that node's domain as connection host."""
+    dom = (link.get("node_domain") or "").strip()
+    if not dom:
+        return fallback_host
+    # strip scheme and path
+    if "://" in dom:
+        dom = dom.split("://", 1)[1]
+    dom = dom.split("/")[0].strip()
+    # strip port if any for host part; keep hostname only for SNI/host
+    if dom:
+        return dom
+    return fallback_host
+
+
 def vless_link_for_link(
     link: dict,
     uid: str,
     host: str,
 ):
+    # Multi-location: prefer the node's public domain so config points to that node
+    host = node_host_from_link(link, host)
+    # If config was synced to remote node, use remote UUID for connection
+    connect_uid = (link.get("remote_uuid") or uid)
+    # Railway public domains should use 443 for clients
+    port = link.get("port", DEFAULT_PORT)
+    try:
+        port = int(port)
+    except Exception:
+        port = DEFAULT_PORT
+    if link.get("node_domain") and port in (80, 8000, DEFAULT_PORT, 0):
+        port = 443
     return generate_vless_link(
-        uid,
+        connect_uid,
         host,
         remark=str(link.get("label") or "Config"),
         protocol=link.get(
@@ -1048,10 +1076,7 @@ def vless_link_for_link(
         alpn=link.get(
             "alpn"
         ),
-        port=link.get(
-            "port",
-            DEFAULT_PORT,
-        ),
+        port=port,
     )
 
 
@@ -1104,8 +1129,11 @@ def get_link_info(
         "show_vless": show_vless,
         "vless": vless_link_for_link(link, uid, host) if show_vless else "",
         "vless_full": vless_link_for_link(link, uid, host),
-        "sub": f"https://{host}/sub/{uid}",
-        "info": f"https://{host}/info/{uid}",
+        "sub": f"https://{node_host_from_link(link, host)}/sub/{uid}",
+        "info": f"https://{node_host_from_link(link, host)}/info/{uid}",
+        "node_id": link.get("node_id") or "",
+        "node_country": link.get("node_country") or "",
+        "node_domain": link.get("node_domain") or "",
         "support": SUPPORT_USERNAME,
     }
 
@@ -1432,6 +1460,7 @@ async def make_link(
     alarm_enabled: bool = False,
     category_id: str = "0",
     config_count: int = 1,
+    uuid: str | None = None,
 ):
 
     protocol = normalize_protocol(protocol)
@@ -1451,7 +1480,11 @@ async def make_link(
     ):
         port = DEFAULT_PORT
 
-    uid = generate_uuid()
+    # Allow remote multi-location sync to force the same UUID on the node
+    if uuid and isinstance(uuid, str) and len(uuid) >= 8:
+        uid = uuid.strip()
+    else:
+        uid = generate_uuid()
 
     record = {
         "label":
@@ -3044,6 +3077,7 @@ async def create_link_api(
         alarm_enabled=alarm_enabled,
         category_id=category_id,
         config_count=config_count,
+        uuid=body.get("uuid") or None,
     )
 
     host = get_host(request)
@@ -3843,7 +3877,25 @@ async def subscription_single(
         for i in range(cfg_count):
             name = random_config_name(used_names)
             used_names.add(name)
-            lines.append(generate_vless_link(uuid, host, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
+            # Multi-location: each line must use the node domain if bound
+            lines.append(vless_link_for_link(link, uuid, host))
+            # override remark to random name while keeping host/uuid/port from helper
+            # rebuild with custom remark for variety in sub clients
+            nh = node_host_from_link(link, host)
+            connect_uid = link.get("remote_uuid") or uuid
+            p = link.get("port", DEFAULT_PORT)
+            try:
+                p = int(p)
+            except Exception:
+                p = DEFAULT_PORT
+            if link.get("node_domain") and p in (80, 8000, DEFAULT_PORT, 0):
+                p = 443
+            lines[-1] = generate_vless_link(
+                connect_uid, nh, remark=name,
+                protocol=link.get("protocol", DEFAULT_PROTOCOL),
+                fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+                alpn=link.get("alpn"), port=p,
+            )
     content = base64.b64encode("\n".join(lines).encode()).decode()
     profile_title = f"0.0.0.0 | {stats_remark}"
     headers = subscription_metadata_headers(
@@ -5525,6 +5577,7 @@ async def create_node(request: Request, _=Depends(require_auth)):
     if method not in ("api", "domain", "token", "manual", "relay"):
         method = "api"
     api_key = (body.get("api_key") or "").strip()
+    admin_password = (body.get("admin_password") or "").strip()
     note = (body.get("note") or "").strip()
     active = bool(body.get("active", True))
 
@@ -5535,6 +5588,7 @@ async def create_node(request: Request, _=Depends(require_auth)):
         "domain": domain,
         "method": method,
         "api_key": api_key,
+        "admin_password": admin_password,
         "note": note,
         "active": active,
         "status": "unknown",
@@ -5556,7 +5610,7 @@ async def update_node(nid: str, request: Request, _=Depends(require_auth)):
         if nid not in NODES:
             raise HTTPException(status_code=404, detail="نود یافت نشد")
         n = NODES[nid]
-        for key in ("name", "country", "domain", "method", "api_key", "note"):
+        for key in ("name", "country", "domain", "method", "api_key", "admin_password", "note"):
             if key in body:
                 val = body[key]
                 if isinstance(val, str):
@@ -5675,9 +5729,9 @@ async def test_all_nodes(_=Depends(require_auth)):
 
 @app.post("/api/links/multi")
 async def create_multi_node_links(request: Request, _=Depends(require_auth)):
-    """ساخت کانفیگ به تعداد نودهای فعال (یا نودهای انتخاب‌شده)"""
+    """ساخت کانفیگ به تعداد نودها + سرور اصلی · یک کانفیگ جدا برای هر کشور · ساب گروهی"""
     body = await request.json()
-    node_ids = body.get("node_ids")  # optional list; if empty = all active
+    node_ids = body.get("node_ids")
     label_base = (body.get("label") or "Multi").strip()
     protocol = body.get("protocol") or DEFAULT_PROTOCOL
     fingerprint = body.get("fingerprint") or DEFAULT_FINGERPRINT
@@ -5686,6 +5740,7 @@ async def create_multi_node_links(request: Request, _=Depends(require_auth)):
     limit_bytes = int(body.get("limit_bytes") or 0)
     ip_limit = int(body.get("ip_limit") or 0)
     speed_limit_bytes = int(body.get("speed_limit_bytes") or 0)
+    include_main = body.get("include_main", True)
     days = body.get("days")
     expires_at = None
     if days:
@@ -5695,43 +5750,192 @@ async def create_multi_node_links(request: Request, _=Depends(require_auth)):
             pass
     config_count = int(body.get("config_count") or 1)
 
+    main_host = get_host(request)
+    # strip scheme if any
+    if main_host.startswith("http"):
+        main_host = main_host.split("://", 1)[1].split("/")[0]
+
     async with NODES_LOCK:
         if node_ids:
-            selected = [(nid, NODES[nid]) for nid in node_ids if nid in NODES]
+            selected = [(nid, dict(NODES[nid])) for nid in node_ids if nid in NODES]
         else:
-            selected = [(nid, n) for nid, n in NODES.items() if n.get("active", True)]
+            selected = [(nid, dict(n)) for nid, n in NODES.items() if n.get("active", True)]
 
-    if not selected:
-        raise HTTPException(status_code=400, detail="هیچ نود فعالی یافت نشد. ابتدا نود اضافه کنید.")
+    # Optionally prepend main/local server as first location
+    locations = []
+    if include_main:
+        locations.append({
+            "nid": "__main__",
+            "name": "MAIN",
+            "country": "Main",
+            "domain": main_host,
+            "is_main": True,
+        })
+    for nid, node in selected:
+        dom = (node.get("domain") or "").strip().rstrip("/")
+        if dom.startswith("http"):
+            host_only = dom.split("://", 1)[1].split("/")[0]
+        else:
+            host_only = dom.split("/")[0] if dom else ""
+        locations.append({
+            "nid": nid,
+            "name": node.get("name") or nid,
+            "country": node.get("country") or "Unknown",
+            "domain": host_only,
+            "domain_full": dom,
+            "is_main": False,
+            "api_key": node.get("api_key") or "",
+            "method": node.get("method") or "api",
+        })
+
+    if not locations:
+        raise HTTPException(status_code=400, detail="هیچ نود فعالی یافت نشد.")
 
     created = []
-    for nid, node in selected:
-        country = node.get("country") or "Unknown"
-        node_name = node.get("name") or nid
+    link_ids = []
+
+    for loc in locations:
+        country = loc["country"]
+        node_name = loc["name"]
+        host_only = loc["domain"]
+        is_main = loc.get("is_main", False)
         label = f"{label_base} · {country} · {node_name}"
+        link_port = 443 if host_only else port
+
         uid, record = await make_link(
             label=label,
             limit_bytes=limit_bytes,
             expires_at=expires_at,
-            note=f"node:{nid}|{country}|{node.get('domain','')}",
+            note=f"node:{loc['nid']}|{country}|{host_only}",
             protocol=protocol,
             fingerprint=fingerprint,
             alpn=alpn,
-            port=port,
+            port=link_port,
             ip_limit=ip_limit,
             speed_limit_bytes=speed_limit_bytes,
-            config_count=config_count,
+            config_count=1,  # exactly 1 config per country/location
         )
         async with LINKS_LOCK:
             if uid in LINKS:
-                LINKS[uid]["node_id"] = nid
+                LINKS[uid]["node_id"] = loc["nid"]
                 LINKS[uid]["node_country"] = country
-                LINKS[uid]["node_domain"] = node.get("domain") or ""
-        created.append({"node_id": nid, "country": country, "label": label, "uid": uid})
+                LINKS[uid]["node_domain"] = host_only
+                LINKS[uid]["port"] = link_port
+                LINKS[uid]["is_main_location"] = is_main
+
+        remote_ok = False
+        remote_msg = ""
+        remote_uid = ""
+
+        # Sync config onto remote node so UUID exists there (skip for main)
+        if not is_main and host_only:
+            try:
+                base = loc.get("domain_full") or host_only
+                if not base.startswith("http"):
+                    base = f"https://{base}"
+                base = base.rstrip("/")
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, verify=False) as client:
+                    # login with same admin password if available
+                    pw = os.environ.get("ADMIN_PASSWORD", "").strip()
+                    cookies = {}
+                    if pw:
+                        try:
+                            lr = await client.post(f"{base}/api/login", json={"password": pw})
+                            if lr.status_code == 200:
+                                cookies = dict(lr.cookies)
+                        except Exception:
+                            pass
+                    payload = {
+                        "label": label,
+                        "protocol": protocol,
+                        "fingerprint": fingerprint,
+                        "alpn": alpn,
+                        "port": link_port,
+                        "limit_bytes": limit_bytes,
+                        "ip_limit": ip_limit,
+                        "speed_limit_bytes": speed_limit_bytes,
+                        "note": f"synced-from-multi|{uid}",
+                        "config_count": 1,
+                    }
+                    if days:
+                        try:
+                            payload["days"] = int(days)
+                        except Exception:
+                            pass
+                    # Prefer creating with same uuid if API supports it
+                    payload["uuid"] = uid
+                    cr = await client.post(f"{base}/api/links", json=payload, cookies=cookies)
+                    if cr.status_code == 200:
+                        remote_ok = True
+                        remote_msg = "synced"
+                        try:
+                            rj = cr.json()
+                            remote_uid = rj.get("uuid") or uid
+                        except Exception:
+                            remote_uid = uid
+                        async with LINKS_LOCK:
+                            if uid in LINKS:
+                                LINKS[uid]["remote_uuid"] = remote_uid or uid
+                                LINKS[uid]["note"] = f"node:{loc['nid']}|{country}|{host_only}|remote:{remote_uid or uid}"
+                    else:
+                        remote_msg = f"remote HTTP {cr.status_code}"
+                        # Fallback: still point client to node domain with local uuid
+                        # User may need same SECRET or manual create on node
+            except Exception as e:
+                remote_msg = str(e)[:120]
+
+        # Build VLESS with NODE host (or main host)
+        preview = ""
+        try:
+            async with LINKS_LOCK:
+                link_snap = dict(LINKS.get(uid) or record)
+            preview = vless_link_for_link(link_snap, uid, host_only or main_host)
+        except Exception as e:
+            remote_msg = (remote_msg + " | " + str(e)[:60]) if remote_msg else str(e)[:80]
+
+        link_ids.append(uid)
+        created.append({
+            "node_id": loc["nid"],
+            "country": country,
+            "label": label,
+            "uid": uid,
+            "node_domain": host_only,
+            "is_main": is_main,
+            "remote_synced": remote_ok,
+            "remote_msg": remote_msg,
+            "vless": preview,
+        })
+
+    # Create a subscription group: 1 config per location/country
+    sub_url = ""
+    sub_id = None
+    try:
+        sub_id, sub = await create_sub_group(
+            name=f"{label_base} · Locations",
+            desc=f"مولتی‌لوکیشن · {len(created)} کشور/نود",
+        )
+        async with SUBS_LOCK:
+            if sub_id in SUBS:
+                SUBS[sub_id]["link_ids"] = list(link_ids)
+        uuid_key = sub.get("uuid_key") if isinstance(sub, dict) else None
+        if not uuid_key:
+            async with SUBS_LOCK:
+                uuid_key = (SUBS.get(sub_id) or {}).get("uuid_key")
+        if uuid_key:
+            sub_url = f"https://{main_host}/sub-group/{uuid_key}"
+    except Exception as e:
+        logger.exception("multi sub group failed: %s", e)
 
     await save_state()
-    log_activity("node", f"ساخت مولتی‌لوکیشن: {len(created)} کانفیگ", "info")
-    return {"ok": True, "created": created, "count": len(created)}
+    log_activity("node", f"ساخت مولتی‌لوکیشن: {len(created)} کانفیگ (شامل main={include_main})", "info")
+    return {
+        "ok": True,
+        "created": created,
+        "count": len(created),
+        "sub_url": sub_url,
+        "sub_id": sub_id,
+        "main_host": main_host,
+    }
 
 
 
@@ -6665,7 +6869,7 @@ DASHBOARD_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>PXPanel 14.0.0</title>
+<title>PXPanel 14.1.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -6858,7 +7062,7 @@ tr:hover td{background:var(--hover)}
     <div class="sb-logo-icon">PX</div>
     <div class="sb-logo-text">
       <div class="sb-logo-name">PXPanel</div>
-      <div class="sb-logo-ver">v14.0.0</div>
+      <div class="sb-logo-ver">v14.1.0</div>
     </div>
   </div>
   <nav class="nav">
@@ -7107,6 +7311,7 @@ tr:hover td{background:var(--hover)}
         </select>
       </div>
       <div class="field"><label>API Key / Token (اختیاری)</label><input id="nodeApiKey" placeholder="در صورت نیاز"></div>
+      <div class="field"><label>رمز ادمین نود (برای همگام‌سازی کانفیگ)</label><input id="nodeAdminPw" type="password" placeholder="همان رمز داشبورد نود — برای ساخت خودکار روی نود"></div>
       <div class="field"><label>یادداشت</label><input id="nodeNote" placeholder="اختیاری"></div>
       <button class="btn btn-p" style="width:100%;margin-top:8px" onclick="addNode()">ذخیره و اتصال نود</button>
     </div>
@@ -7957,14 +8162,16 @@ async function addNode(){
   const domain=(document.getElementById('nodeDomain').value||'').trim();
   const method=document.getElementById('nodeMethod').value;
   const api_key=(document.getElementById('nodeApiKey').value||'').trim();
+  const admin_password=(document.getElementById('nodeAdminPw')&&document.getElementById('nodeAdminPw').value||'').trim();
   const note=(document.getElementById('nodeNote').value||'').trim();
   if(!domain){toast('دامنه نود الزامی است');return}
-  const data=await api('/api/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,country,domain,method,api_key,note,active:true})});
+  const data=await api('/api/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,country,domain,method,api_key,admin_password,note,active:true})});
   if(!data)return;
   toast('نود ذخیره شد');
   document.getElementById('nodeName').value='';
   document.getElementById('nodeDomain').value='';
   document.getElementById('nodeApiKey').value='';
+  if(document.getElementById('nodeAdminPw'))document.getElementById('nodeAdminPw').value='';
   document.getElementById('nodeNote').value='';
   loadNodes();
 }
@@ -7997,10 +8204,21 @@ async function toggleNodeActive(id,active){
 async function createMultiFromNodes(){
   const label=prompt('نام پایه کانفیگ‌ها:','Multi')||'Multi';
   toast('در حال ساخت...');
-  const data=await api('/api/links/multi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,protocol:'vless-ws'})});
+  const data=await api('/api/links/multi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,protocol:'vless-ws',include_main:true})});
   if(!data)return;
-  toast(data.count+' کانفیگ ساخته شد');
+  let msg=(data.count||0)+' کانفیگ ساخته شد (هر کشور یک عدد)';
+  if(data.sub_url){
+    msg+=' · ساب گروهی آماده است';
+    try{await navigator.clipboard.writeText(data.sub_url)}catch(e){}
+    console.log('Multi sub:',data.sub_url);
+    alert('ساب مولتی‌لوکیشن:\n'+data.sub_url+'\n\nدر این ساب برای هر کشور/نود یک کانفیگ جداست.\nآدرس هر کانفیگ = دامنه همان نود.');
+  }
+  if(data.created&&data.created.length){
+    console.log('Created locations:',data.created.map(c=>({country:c.country,domain:c.node_domain,vless:(c.vless||'').slice(0,80)})));
+  }
+  toast(msg);
   if(typeof refreshAll==='function')refreshAll();
+  if(typeof loadNodes==='function')loadNodes();
 }
 
 async function createGroup(){
